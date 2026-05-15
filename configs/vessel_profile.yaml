@@ -1,0 +1,40 @@
+# maritime_perception — vessel profile
+# Vessel-specific calibration constants.
+# These do NOT change between voyages. Change only when hardware changes.
+# A software update should never reset these values.
+
+vessel:
+  name: "vatoz"
+  lidar_height_above_waterline_m: 0.9   # ~3 ft 
+
+lidar_mounting:
+  # Angle offset: positive = sensor rotated clockwise from bow
+  # 0.0 means sensor 0° is aligned with vessel bow
+  angle_offset_deg: 0.0
+
+  # Offset from vessel centre of rotation (metres)
+  # forward_m: positive = sensor ahead of CoR
+  # starboard_m: positive = sensor to starboard of CoR
+  forward_m: 0.0
+  starboard_m: 0.0
+
+# FOV mask — angular sectors to blank (self-returns)
+# Format: [start_deg, end_deg]
+# Sectors may wrap around 0° (e.g. [350, 10] blanks aft-bow sector)
+# Add one entry per obstruction: mast, radar dome, bollard, railing, etc.
+# Run a calibration scan with vessel stationary to identify these.
+fov_mask:
+  - [178.0, 182.0]    # aft mast — adjust to vatoz
+
+# IMU mounting (for future ego-motion compensation)
+imu_mounting:
+  # rotation from vessel frame to IMU frame (degrees)
+  roll_offset_deg: 0.0
+  pitch_offset_deg: 0.0
+  yaw_offset_deg: 0.0
+
+# RTK antenna position relative to vessel centre of rotation
+rtk_mounting:
+  forward_m: 0.0
+  starboard_m: 0.0
+  up_m: 1.5

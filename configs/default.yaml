@@ -1,0 +1,63 @@
+# maritime_perception — runtime configuration
+# Tune these parameters per deployment / sea state.
+# Do NOT put vessel geometry here — that belongs in vessel_profile.yaml.
+
+lidar:
+  port: "/dev/ttyUSB0"
+  baudrate: 1000000
+  timeout_s: 5.0
+  reconnect_delay_s: 2.0
+  max_reconnect_attempts: 10
+
+preprocessing:
+  range_min_m: 0.30        # RPLidar S2 blind zone + hull clearance
+  range_max_m: 30.0        # reliable detection range
+  min_intensity: 0         # minimum return intensity (0 = accept all)
+
+noise_filter:
+  cell_size_m: 0.25        # grid cell resolution
+  min_hits_base: 5         # base persistence threshold (calm water)
+  min_hits_max: 8          # max persistence threshold (rough sea)
+  ttl_scans: 15            # scans before a cell is evicted
+  grid_radius_m: 35.0      # grid half-size (must exceed range_max_m)
+  clutter_adapt_rate: 0.1  # how fast threshold adapts to sea state
+
+segmentation:
+  jump_distance_m: 0.50    # base gap threshold for new segment
+  adaptive_k: 0.02         # range scaling factor (threshold += range * k)
+  min_points: 3            # minimum points to keep a segment
+  min_arc_deg: 0.5         # minimum angular arc span of a segment
+  max_points: 2000         # safety cap per segment
+  merge_distance_m: 1.0    # centroid distance to merge two segments
+
+extraction:
+  max_obstacle_radius_m: 15.0   # discard oversized clusters (walls)
+  confidence_pts_ref: 30        # point count for full confidence
+  confidence_range_penalty: 0.5 # max penalty at max range (0.5 = halved)
+
+tracking:
+  gate_mahalanobis: 9.21       # chi-squared 99.5% gate for 2-DOF
+  min_hits_confirm: 3          # scans to promote tentative → confirmed
+  max_misses_tentative: 3      # misses before tentative → dead
+  max_misses_confirmed: 10     # misses before confirmed → coasting
+  max_misses_coast: 5          # misses before coasting → dead
+  min_confidence_output: 0.25  # confirmed tracks below this not published
+
+  kalman:
+    process_noise_pos: 0.1     # Q matrix — position uncertainty per scan
+    process_noise_vel: 0.5     # Q matrix — velocity uncertainty per scan
+    measurement_noise: 0.3     # R matrix — observation position noise (m)
+
+fusion:
+  cycle_rate_hz: 10.0          # main fusion loop rate
+
+interfaces:
+  json_output_path: "~/tmp/world_model.json"
+
+health:
+  max_scan_gap_s: 1.0          # trigger DEGRADED if no scan for this long
+  max_latency_ms: 80.0         # warn if pipeline takes longer than this
+  stats_window_scans: 100      # rolling window for statistics
+
+runtime:
+  loop_rate_hz: 10.0

@@ -1,0 +1,21 @@
+[project]
+name = "maritime-perception"
+version = "0.1.0"
+description = "Production-grade maritime obstacle detection pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "pyyaml>=6.0",
+    "rplidar-roboticia>=0.9.5",
+]
+
+[project.scripts]
+maritime-perception = "maritime_perception.main:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
