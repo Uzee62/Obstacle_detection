@@ -614,20 +614,22 @@ class RPLidarDriver:
 
     def _read_descriptor(self) -> dict:
         """
-        Read a 7-byte response descriptor.
-        Format: 0xA5 0x5A | size(30 bits) + send_mode(2 bits) | data_type
+        Read a response descriptor. Supports two on-the-wire forms:
 
-        We scan the stream for the 0xA5 0x5A sync rather than assume
-        it sits at byte 0. Some S2 firmware revisions emit a trailing
-        byte or two after the documented-length payload of a previous
-        response (e.g. GET_INFO), and those leftovers would otherwise
-        be read as the next descriptor's first bytes and cause a
-        "Bad descriptor sync" failure. Tolerating up to MAX_SCAN
-        pre-sync bytes resyncs cleanly without us having to know each
-        firmware's exact payload size.
+          1. Legacy 7-byte: 0xA5 0x5A | size(30b)+mode(2b) | type
+             — used by RPLidar A1/A2/S1 and the public protocol spec.
+
+          2. S2 compact 4-byte: 0xA5 | size_lo | size_hi | type
+             — emitted by S2 firmware for at least GET_INFO and
+             GET_HEALTH. Legacy drivers like rplidar-roboticia fail
+             on this form ("descriptor length mismatch") because they
+             demand 0x5A as the second byte.
+
+        We scan up to MAX_SCAN bytes for a leading 0xA5 to tolerate
+        stray pre-sync bytes from a previous truncated response,
+        then branch on the next byte to decide which form to parse.
         """
         MAX_SCAN = 64
-        prev     = -1
         scanned  = 0
         seen     : list[int] = []
         while scanned < MAX_SCAN:
@@ -639,39 +641,105 @@ class RPLidarDriver:
                 )
             scanned += 1
             seen.append(b[0])
-            if prev == SYNC_BYTE and b[0] == SYNC_BYTE2:
-                rest = self._serial.read(DESCRIPTOR_LEN - 2)
-                if len(rest) < DESCRIPTOR_LEN - 2:
+            if b[0] != SYNC_BYTE:
+                continue
+
+            b2 = self._serial.read(1)
+            if not b2:
+                raise RuntimeError(
+                    f"Descriptor truncated after 0xA5 — "
+                    f"got {[f'0x{x:02X}' for x in seen]}"
+                )
+            scanned += 1
+            seen.append(b2[0])
+
+            if b2[0] == SYNC_BYTE2:
+                # Legacy 7-byte form.
+                rest = self._serial.read(5)
+                if len(rest) < 5:
                     raise RuntimeError(
-                        f"Descriptor truncated: got {len(rest) + 2} bytes"
+                        f"Legacy descriptor truncated — got "
+                        f"{[f'0x{x:02X}' for x in seen]} "
+                        f"+ {[f'0x{x:02X}' for x in rest]}"
                     )
                 packed    = struct.unpack_from("<I", rest, 0)[0]
                 data_len  = packed & 0x3FFFFFFF
                 send_mode = (packed >> 30) & 0x03
                 data_type = rest[4]
-                if scanned > 1:
-                    log.debug(
-                        "Descriptor sync found after skipping %d stray byte(s)",
-                        scanned - 1,
+                form      = "legacy"
+            else:
+                # S2 compact 4-byte form. b2 is size_lo; read size_hi
+                # and type next.
+                rest = self._serial.read(2)
+                if len(rest) < 2:
+                    raise RuntimeError(
+                        f"S2 compact descriptor truncated — got "
+                        f"{[f'0x{x:02X}' for x in seen]} "
+                        f"+ {[f'0x{x:02X}' for x in rest]}"
                     )
-                return {
-                    "len"      : data_len,
-                    "send_mode": send_mode,
-                    "type"     : data_type,
-                }
-            prev = b[0]
+                data_len  = b2[0] | (rest[0] << 8)
+                send_mode = 0
+                data_type = rest[1]
+                form      = "s2-compact"
+
+            if scanned > 2:
+                log.debug(
+                    "Descriptor sync found after skipping %d stray byte(s)",
+                    scanned - 2,
+                )
+            log.debug(
+                "Descriptor: form=%s len=%d type=0x%02X",
+                form, data_len, data_type,
+            )
+            return {
+                "len"      : data_len,
+                "send_mode": send_mode,
+                "type"     : data_type,
+            }
 
         raise RuntimeError(
-            f"No descriptor sync (0xA5 0x5A) within {MAX_SCAN} bytes"
+            f"No descriptor sync (0xA5) within {MAX_SCAN} bytes — "
+            f"got {[f'0x{x:02X}' for x in seen]}"
         )
 
+    def _read_payload(
+        self,
+        expected   : int,
+        max_seconds: float = 0.5,
+    ) -> bytes:
+        """Read up to `expected` bytes within `max_seconds`. Used for
+        command payloads (GET_INFO, GET_HEALTH). Unlike a single
+        `serial.read(N)` call, this gives up early instead of blocking
+        the full per-read timeout when the device sends fewer bytes
+        than the descriptor advertised — which some S2 firmware
+        revisions do for the info payload."""
+        deadline = time.monotonic() + max_seconds
+        buf      = bytearray()
+        while len(buf) < expected and time.monotonic() < deadline:
+            chunk = self._serial.read(expected - len(buf))
+            if chunk:
+                buf.extend(chunk)
+            else:
+                time.sleep(0.005)
+        return bytes(buf)
+
     def _get_info(self) -> dict:
-        """Get device info — model, firmware version, serial number."""
+        """Get device info — model, firmware version, serial number.
+
+        Tolerates short payloads: some S2 firmware variants advertise
+        20 bytes in the descriptor but actually send fewer. We accept
+        whatever arrives and parse what we can."""
         self._send_command(CMD_GET_INFO)
         descriptor = self._read_descriptor()
-        raw = self._serial.read(descriptor["len"])
+        raw = self._read_payload(descriptor["len"], max_seconds=0.5)
 
-        if len(raw) < 20:
+        if len(raw) < descriptor["len"]:
+            log.debug(
+                "Info payload short: %d/%d bytes (raw=%s)",
+                len(raw), descriptor["len"], raw.hex(),
+            )
+
+        if len(raw) < 4:
             return {}
 
         return {
@@ -686,9 +754,9 @@ class RPLidarDriver:
         """Get health status. Returns 0=Good, 1=Warning, 2=Error."""
         self._send_command(CMD_GET_HEALTH)
         descriptor = self._read_descriptor()
-        raw = self._serial.read(descriptor["len"])
+        raw = self._read_payload(descriptor["len"], max_seconds=0.5)
 
-        if len(raw) < 3:
+        if len(raw) < 1:
             return HEALTH_ERROR
 
         return raw[0]   # 0=Good, 1=Warning, 2=Error

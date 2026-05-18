@@ -1,3 +1,10 @@
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)-8s | %(name)-30s | %(message)s",
+)
+
 from maritime_perception.sensors.lidar.driver import RPLidarDriver
 
 driver = RPLidarDriver(port="/dev/ttyUSB0", baudrate=1_000_000)
