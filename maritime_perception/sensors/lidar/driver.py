@@ -250,6 +250,12 @@ class RPLidarDriver:
                 time.sleep(_Timing.POLL_INTERVAL_S)
         return drained
 
+    # Sanity bound on advertised payload size. The largest legitimate
+    # response (GET_INFO) is 20 bytes; anything larger means we read
+    # garbage as a descriptor and should bail instead of asking the
+    # payload reader to wait for hundreds of MB.
+    _MAX_REASONABLE_PAYLOAD = 256
+
     def _exchange_info(self) -> Optional[proto.DeviceInfo]:
         self._write(proto.encode_command(proto.Command.GET_INFO))
         desc = proto.read_descriptor(self._read_byte)
@@ -257,6 +263,14 @@ class RPLidarDriver:
             "Info descriptor: form=%s len=%d type=0x%02X",
             desc.form, desc.data_len, desc.data_type,
         )
+        if (desc.data_type != proto.DataType.INFO
+                or desc.data_len > self._MAX_REASONABLE_PAYLOAD):
+            log.warning(
+                "GET_INFO returned bogus descriptor (form=%s len=%d "
+                "type=0x%02X); proceeding without device info",
+                desc.form, desc.data_len, desc.data_type,
+            )
+            return None
         raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
         if len(raw) < desc.data_len:
             log.debug(
@@ -266,9 +280,9 @@ class RPLidarDriver:
         return proto.parse_info_payload(raw)
 
     def _exchange_health(self) -> Optional[proto.Health]:
-        """Returns None if the device fails to respond at all — some
-        S2 firmwares ignore GET_HEALTH while still being usable for
-        scans. Real ERROR status is still returned as Health.ERROR."""
+        """Returns None if the device fails to respond meaningfully —
+        some S2 firmwares ignore GET_HEALTH while still being usable
+        for scans. Real ERROR status is still returned as Health.ERROR."""
         self._write(proto.encode_command(proto.Command.GET_HEALTH))
         try:
             desc = proto.read_descriptor(self._read_byte)
@@ -279,6 +293,14 @@ class RPLidarDriver:
             "Health descriptor: form=%s len=%d type=0x%02X",
             desc.form, desc.data_len, desc.data_type,
         )
+        if (desc.data_type != proto.DataType.HEALTH
+                or desc.data_len > self._MAX_REASONABLE_PAYLOAD):
+            log.warning(
+                "GET_HEALTH returned bogus descriptor (form=%s len=%d "
+                "type=0x%02X); treating health as unknown",
+                desc.form, desc.data_len, desc.data_type,
+            )
+            return None
         raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
         return proto.parse_health_payload(raw)
 

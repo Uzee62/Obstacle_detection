@@ -124,20 +124,22 @@ def read_descriptor(read_byte: ByteReader) -> Descriptor:
         b1 = read_byte()
         if b1 is None:
             raise ProtocolError("Descriptor truncated after 0xA5")
-        if b1 != SYNC2:
-            raise ProtocolError(
-                f"Expected 0x5A after 0xA5, got 0x{b1:02X}"
+        if b1 == SYNC2:
+            rest = _read_n(read_byte, 5)
+            if rest is None:
+                raise ProtocolError("Legacy descriptor truncated")
+            packed = struct.unpack("<I", bytes(rest[:4]))[0]
+            return Descriptor(
+                form      = "legacy",
+                data_len  = packed & 0x3FFFFFFF,
+                send_mode = (packed >> 30) & 0x03,
+                data_type = rest[4],
             )
-        rest = _read_n(read_byte, 5)
-        if rest is None:
-            raise ProtocolError("Legacy descriptor truncated")
-        packed = struct.unpack("<I", bytes(rest[:4]))[0]
-        return Descriptor(
-            form      = "legacy",
-            data_len  = packed & 0x3FFFFFFF,
-            send_mode = (packed >> 30) & 0x03,
-            data_type = rest[4],
-        )
+        # 0xA5 was not followed by 0x5A. Treat the 0xA5 as a stray
+        # pre-sync byte (common when residual bytes from a previous
+        # operation sit ahead of the real response) and continue as
+        # if b1 were the first byte of a naked descriptor.
+        b0 = b1
 
     # Naked 5-byte form: b0 is the low byte of a 4-byte little-endian
     # (size30 + mode2) field, followed by a 1-byte data_type.
