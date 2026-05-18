@@ -401,6 +401,11 @@ class RPLidarDriver:
             self._serial.dtr = False
             self._serial.rts = False
 
+            # If the user just power-cycled the lidar, it may still be
+            # booting and streaming its ASCII banner. Wait for the line
+            # to actually settle before we start sending commands.
+            time.sleep(1.0)
+
             # Bring the device to a known-quiescent state.
             #
             # We deliberately do NOT send CMD_RESET here. On the S2,
@@ -624,13 +629,16 @@ class RPLidarDriver:
         MAX_SCAN = 64
         prev     = -1
         scanned  = 0
+        seen     : list[int] = []
         while scanned < MAX_SCAN:
             b = self._serial.read(1)
             if not b:
                 raise RuntimeError(
-                    f"Descriptor read timeout after {scanned} bytes"
+                    f"Descriptor read timeout after {scanned} bytes — "
+                    f"got {[f'0x{x:02X}' for x in seen]}"
                 )
             scanned += 1
+            seen.append(b[0])
             if prev == SYNC_BYTE and b[0] == SYNC_BYTE2:
                 rest = self._serial.read(DESCRIPTOR_LEN - 2)
                 if len(rest) < DESCRIPTOR_LEN - 2:
