@@ -395,28 +395,36 @@ class RPLidarDriver:
                 stopbits  = serial.STOPBITS_ONE,
             )
 
-            # flush any stale bytes from previous session
+            # Silence any scan stream left running by a previous session,
+            # then drain everything sitting in the OS / FTDI buffer.
+            self._send_command(CMD_STOP)
+            time.sleep(0.05)
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
 
-            # reset the sensor cleanly
+            # Reset cleanly. The S2 then emits an ASCII boot banner
+            # ("RP LIDAR System...") that takes ~0.7–1.5 s — read past it
+            # until the line is quiet, otherwise those bytes get mistaken
+            # for the next response descriptor (0xA5 0x5A).
             self._send_command(CMD_RESET)
-            time.sleep(0.1)
-            self._serial.reset_input_buffer()
+            self._drain_until_quiet(max_seconds=2.0, quiet_window=0.1)
 
             # verify it is alive
             info   = self._get_info()
             health = self._get_health()
 
             self._connected = True
+            health_label = (
+                ["Good", "Warning", "Error"][health]
+                if isinstance(health, int) and 0 <= health <= 2
+                else str(health)
+            )
             log.info(
                 "RPLidar connected — model=%s firmware=%s.%s health=%s",
                 info.get("model", "?"),
                 info.get("fw_major", "?"),
                 info.get("fw_minor", "?"),
-                ["Good", "Warning", "Error"].get(health, "Unknown")
-                if isinstance(health, int)
-                else health,
+                health_label,
             )
 
             if health == HEALTH_ERROR:
@@ -430,6 +438,26 @@ class RPLidarDriver:
             raise RuntimeError(
                 f"Cannot open {self._port}: {exc}"
             ) from exc
+
+    def _drain_until_quiet(
+        self,
+        max_seconds  : float = 2.0,
+        quiet_window : float = 0.1,
+    ) -> None:
+        """Discard incoming bytes until the line stays silent for
+        `quiet_window` seconds, or `max_seconds` total has elapsed."""
+        deadline  = time.monotonic() + max_seconds
+        last_byte = time.monotonic()
+        while time.monotonic() < deadline:
+            n = self._serial.in_waiting
+            if n:
+                self._serial.read(n)
+                last_byte = time.monotonic()
+            elif time.monotonic() - last_byte >= quiet_window:
+                break
+            else:
+                time.sleep(0.01)
+        self._serial.reset_input_buffer()
 
     def _safe_disconnect(self) -> None:
         """Stop motor and close port without raising."""
