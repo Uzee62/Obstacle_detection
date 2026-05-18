@@ -395,19 +395,27 @@ class RPLidarDriver:
                 stopbits  = serial.STOPBITS_ONE,
             )
 
-            # Silence any scan stream left running by a previous session,
-            # then drain everything sitting in the OS / FTDI buffer.
+            # Bring the device to a known-quiescent state.
+            #
+            # We deliberately do NOT send CMD_RESET here. On the S2,
+            # RESET triggers an ASCII boot banner that begins anywhere
+            # from 200 ms to 1 s after the command and lasts a few
+            # hundred ms — the gap before the first banner byte is long
+            # enough that any drain loop will think the line is already
+            # quiet and exit, after which the banner arrives mid-way
+            # through the next descriptor read (giving "P ", " S" etc.
+            # as the failed sync bytes). CMD_STOP has no banner and is
+            # enough to silence a scan stream left running by a previous
+            # session. Two STOPs catch the case where a scan packet was
+            # already in transit when the first STOP was processed.
             self._send_command(CMD_STOP)
-            time.sleep(0.05)
+            time.sleep(0.1)
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
 
-            # Reset cleanly. The S2 then emits an ASCII boot banner
-            # ("RP LIDAR System...") that takes ~0.7–1.5 s — read past it
-            # until the line is quiet, otherwise those bytes get mistaken
-            # for the next response descriptor (0xA5 0x5A).
-            self._send_command(CMD_RESET)
-            self._drain_until_quiet(max_seconds=2.0, quiet_window=0.1)
+            self._send_command(CMD_STOP)
+            time.sleep(0.05)
+            self._drain_until_quiet(max_seconds=0.5, quiet_window=0.15)
 
             # verify it is alive
             info   = self._get_info()
