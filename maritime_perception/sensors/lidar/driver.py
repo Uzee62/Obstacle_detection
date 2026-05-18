@@ -1,290 +1,68 @@
-# """
-# sensors/lidar/driver.py
+"""sensors/lidar/driver.py
 
-# RPLidar S2 hardware driver with auto-reconnect.
+Slamtec RPLidar S-series hardware driver.
 
-# Responsibilities
+Owns the serial port lifecycle and walks the device through
+    open → STOP/drain handshake → SCAN → one revolution → STOP.
+Auto-reconnects read errors up to `max_reconnect_attempts`.
 
-# - Open serial connection to RPLidar
-# - Read one complete 360° scan
-# - Timestamp at acquisition (monotonic_ns)
-# - Convert raw driver units (mm) to metres
-# - Auto-reconnect on disconnect or error
-# - Expose health status
-
-# This module does ZERO perception. It is hardware IO only.
-# The output is a LidarScan — a timestamped list of (angle, distance) pairs.
-# All interpretation happens downstream.
-
-# RPLidar library notes
-# Uses pyrplidar (not rplidar-roboticia) for S2 compatibility.
-# rplidar-roboticia fails with "descriptor length mismatch" on S2 because it
-# uses 115200 baud and doesn't handle S2's extended response descriptor format.
-# pyrplidar uses 1000000 baud and handles the S2 protocol correctly.
-# Each measurement exposes .quality (int), .angle (float deg), .distance (float mm).
-# """
-
-# from __future__ import annotations
-
-# import logging
-# import time
-# from dataclasses import dataclass, field
-
-# from maritime_perception.models.common import Header, SensorSource, now_ns
-
-# log = logging.getLogger(__name__)
-
-
-# # Internal scan model (driver-level only)
-
-
-# # define RAW SCAN POINTS as a dataclass for clarity
-# @dataclass(slots=True)
-# class RawScanPoint:
-#     angle_deg  : float
-#     distance_m : float
-#     quality    : int
-
-# #define lidar SCAN POINTS
-# # represents a full 360° scan as acquired from the driver, before preprocessing
-# @dataclass
-# class LidarScan:
-#     """Raw scan as produced by the driver. Not yet preprocessed."""
-#     header : Header
-#     points : list[RawScanPoint]
-#     scan_id: int = 0
-
-#     def __len__(self) -> int:
-#         return len(self.points)
-
-
-# # RPLidar Driver
-# # responsible for talking to the physical LiDAR.
-
-# class RPLidarDriver:
-#     """
-#     Hardware driver for Slamtec RPLidar S2.
-
-#     Usage
-    
-#         driver = RPLidarDriver(port="/dev/ttyUSB0")
-#         driver.connect()
-#         scan = driver.read_scan()
-#         driver.disconnect()
-
-#     Auto-reconnect:
-
-#     read_scan() handles reconnection internally.
-#     If the serial connection drops, it waits reconnect_delay_s and retries
-#     up to max_reconnect_attempts times before raising RuntimeError.
-#     """
-
-#     SENSOR_ID = "rplidar_s2"
-#     FRAME_ID  = "lidar"
-
-#     def __init__(
-#         self,
-#         port                   : str   = "/dev/ttyUSB0",
-#         timeout_s              : float = 5.0,
-#         reconnect_delay_s      : float = 2.0,
-#         max_reconnect_attempts : int   = 10,
-#     ) -> None:
-        
-#         self._port            = port
-#         self._timeout_s       = timeout_s
-
-#         self._reconnect_delay = reconnect_delay_s
-#         self._max_attempts    = max_reconnect_attempts
-
-#         self._lidar           = None
-#         self._scan_id         = 0
-#         self._connected       = False
-
-#         log.info("RPLidarDriver initialised on port %s", port)
-
-
-#     # Connection management
-
-#     def connect(self) -> None:
-#         """Open connection to the RPLidar. Call before read_scan()."""
-#         self._connect_once()
-
-#     def disconnect(self) -> None:
-#         """Gracefully stop and disconnect."""
-#         self._safe_disconnect()
-
-#     def is_connected(self) -> bool:
-#         return self._connected
-
-#     # Main read method
-#     # handles auto-reconnect on error, returns one complete scan with timestamp.
-
-#     def read_scan(self) -> LidarScan:
-#         """
-#         Read one complete 360° scan from the RPLidar.
-#         Blocks until a scan is received.
-#         Auto-reconnects on error.
-
-#         Returns
-#         LidarScan with timestamp set at moment of acquisition.
-
-#         Raises
-        
-#         RuntimeError if unable to reconnect after max_reconnect_attempts.
-#         """
-#         attempts = 0
-
-#         while attempts <= self._max_attempts:
-#             try:
-#                 return self._read_one_scan()
-#             except Exception as exc:
-#                 attempts += 1
-#                 log.warning(
-#                     "RPLidar read error (attempt %d/%d): %s",
-#                     attempts, self._max_attempts, exc,
-#                 )
-#                 self._safe_disconnect()
-
-#                 if attempts > self._max_attempts:
-#                     raise RuntimeError(
-#                         f"RPLidar failed after {self._max_attempts} "
-#                         f"reconnect attempts on port {self._port}"
-#                     ) from exc
-
-#                 log.info(
-#                     "Reconnecting in %.1fs ...", self._reconnect_delay
-#                 )
-#                 time.sleep(self._reconnect_delay)
-#                 self._connect_once()
-
-#         # unreachable but satisfies type checker
-#         raise RuntimeError("RPLidar read_scan failed")
-
-#     # Private
-#     # Connect once without retry logic, raises on failure.
-
-#     def _connect_once(self) -> None:
-#         try:
-#             from pyrplidar import PyRPlidar
-#             self._lidar = PyRPlidar()
-#             self._lidar.connect(
-#                 port     = self._port,
-#                 baudrate = 1000000,
-#                 timeout  = int(self._timeout_s),
-#             )
-#             self._connected = True
-#             info   = self._lidar.get_info()
-#             health = self._lidar.get_health()
-#             fw = info.get("firmware", ("?", "?"))
-#             log.info(
-#                 "RPLidar connected: model=%s firmware=%s.%s health=%s",
-#                 info.get("model"),
-#                 fw[0], fw[1],
-#                 health[0],
-#             )
-#         except Exception as exc:
-#             self._connected = False
-#             raise RuntimeError(
-#                 f"Failed to connect to RPLidar on {self._port}: {exc}"
-#             ) from exc
-
-#     def _read_one_scan(self) -> LidarScan:
-#         """Read one scan from the live iterator."""
-#         if not self._connected or self._lidar is None:
-#             raise RuntimeError("RPLidar not connected")
-
-#         scan_generator = self._lidar.start_scan()
-#         for raw_scan in scan_generator():
-#             ts_ns = now_ns()
-#             self._scan_id += 1
-
-#             points = [
-#                 RawScanPoint(
-#                     angle_deg  = float(m.angle),
-#                     distance_m = float(m.distance) / 1000.0,  # mm to metre
-#                     quality    = int(m.quality),
-#                 )
-#                 for m in raw_scan
-#                 if m.quality > 0 and m.distance > 0
-#             ]
-
-#             return LidarScan(
-#                 header=Header(
-#                     timestamp_ns = ts_ns,
-#                     sensor_id    = self.SENSOR_ID,
-#                     frame_id     = self.FRAME_ID,
-#                     source       = SensorSource.LIDAR,
-#                 ),
-#                 points  = points,
-#                 scan_id = self._scan_id,
-#             )
-
-#         raise RuntimeError("start_scan ended without yielding a scan")
-
-#     def _safe_disconnect(self) -> None:
-#         """Disconnect without raising."""
-#         try:
-#             if self._lidar is not None:
-#                 self._lidar.stop()
-#                 self._lidar.disconnect()
-#         except Exception:
-#             pass
-#         finally:
-#             self._lidar     = None
-#             self._connected = False
-
-
-"""
-sensors/lidar/driver.py
-=======================
-RPLidar S2 driver using direct serial communication.
-Uses PySerial and the RPLidar binary protocol directly.
-No third-party RPLidar Python libraries required.
-
-Protocol reference: Slamtec RPLidar Communication Protocol v2.4
-Baud rate: 1,000,000 for RPLidar S2
+The on-wire protocol (descriptor parsing, command encoding,
+scan-packet decoding) lives in `protocol.py`; this module is
+intentionally I/O and state-machine only.
 """
 
 from __future__ import annotations
 
 import logging
-import struct
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Final, Optional
 
 import serial
 
 from maritime_perception.models.common import Header, SensorSource, now_ns
+from maritime_perception.sensors.lidar import protocol as proto
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Protocol constants
-# ---------------------------------------------------------------------------
-
-SYNC_BYTE       = 0xA5
-SYNC_BYTE2      = 0x5A
-
-CMD_STOP        = 0x25
-CMD_SCAN        = 0x20
-CMD_GET_INFO    = 0x50
-CMD_GET_HEALTH  = 0x52
-CMD_RESET       = 0x40
-
-# Response descriptor length
-DESCRIPTOR_LEN  = 7
-
-# Scan response: 5 bytes per measurement
-SCAN_RESP_LEN   = 5
-
-# Health status codes
-HEALTH_GOOD     = 0
-HEALTH_WARNING  = 1
-HEALTH_ERROR    = 2
-
 
 # ---------------------------------------------------------------------------
-# Internal scan model 
+# Tuning constants
+#
+# These are wire-level device timings — they live with the driver, not in
+# vessel YAML. If you tweak one, make sure the comment still explains why.
+# ---------------------------------------------------------------------------
+
+class _Timing:
+    # Time the device gets to settle after we open the port, in case it
+    # was just power-cycled and is still emitting its ASCII boot banner.
+    SETTLE_AFTER_OPEN_S : Final[float] = 1.0
+
+    # CMD_STOP can be ignored when it lands inside the lidar's RX state
+    # for a scan packet. Send a few in a row to defeat that race.
+    STOP_REPEAT         : Final[int]   = 3
+    STOP_GAP_S          : Final[float] = 0.05
+    STOP_DRAIN_S        : Final[float] = 0.02   # short post-STOP pause
+
+    # After STOP, the device may keep emitting bytes already queued in
+    # its TX FIFO. Drain until the wire stays silent for this long. The
+    # quiet window must exceed the worst-case gap between scan-packet
+    # bursts, otherwise we false-trigger and exit mid-stream.
+    DRAIN_MAX_S         : Final[float] = 2.0
+    DRAIN_QUIET_S       : Final[float] = 0.4
+
+    # Cap on info/health payload reads. Some S2 firmwares advertise more
+    # bytes in the descriptor than they actually send; take what arrives
+    # rather than wait out the port-level timeout.
+    PAYLOAD_READ_S      : Final[float] = 0.5
+
+    # Poll cadence for non-blocking I/O loops.
+    POLL_INTERVAL_S     : Final[float] = 0.005
+
+
+# ---------------------------------------------------------------------------
+# Public data model (preprocessor.py, pipeline.py, test_pipeline.py import
+# these names directly — keep them stable)
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
@@ -310,10 +88,18 @@ class LidarScan:
 # ---------------------------------------------------------------------------
 
 class RPLidarDriver:
-    """
-    RPLidar S2 driver using direct PySerial communication.
-    Speaks the Slamtec binary protocol directly.
-    No third-party RPLidar library required.
+    """Slamtec RPLidar (S1/S2) driver speaking the binary protocol
+    directly over PySerial. No third-party RPLidar Python library
+    required.
+
+    Usage:
+        driver = RPLidarDriver(port="/dev/ttyUSB0")
+        driver.connect()
+        scan = driver.read_scan()       # blocks for one revolution
+        driver.disconnect()
+
+    read_scan() auto-reconnects on transient errors up to
+    `max_reconnect_attempts` before giving up with RuntimeError.
     """
 
     SENSOR_ID = "rplidar_s2"
@@ -332,14 +118,12 @@ class RPLidarDriver:
         self._timeout_s       = timeout_s
         self._reconnect_delay = reconnect_delay_s
         self._max_attempts    = max_reconnect_attempts
-        self._serial          : serial.Serial | None = None
+        self._serial          : Optional[serial.Serial] = None
         self._scan_id         = 0
         self._connected       = False
         log.info("RPLidarDriver initialised on %s at %d baud", port, baudrate)
 
-    # ------------------------------------------------------------------
-    # Public API 
-    # ------------------------------------------------------------------
+    # ----- Public API -----------------------------------------------------
 
     def connect(self) -> None:
         """Open serial connection and verify sensor health."""
@@ -353,11 +137,8 @@ class RPLidarDriver:
         return self._connected
 
     def read_scan(self) -> LidarScan:
-        """
-        Read one complete 360° scan.
-        Blocks until a full scan is received.
-        Auto-reconnects on error.
-        """
+        """Read one complete 360° scan. Blocks until a full revolution
+        arrives. Auto-reconnects on transient error."""
         attempts = 0
         while attempts <= self._max_attempts:
             try:
@@ -376,115 +157,216 @@ class RPLidarDriver:
                 log.info("Reconnecting in %.1fs ...", self._reconnect_delay)
                 time.sleep(self._reconnect_delay)
                 self._connect_once()
-
         raise RuntimeError("RPLidar read_scan failed")
 
-    # ------------------------------------------------------------------
-    # Connection
-    # ------------------------------------------------------------------
+    # ----- Connect / handshake --------------------------------------------
 
     def _connect_once(self) -> None:
-        """Open port, reset sensor, verify health."""
         try:
-            self._serial = serial.Serial(
-                port      = self._port,
-                baudrate  = self._baudrate,
-                timeout   = self._timeout_s,
-                bytesize  = serial.EIGHTBITS,
-                parity    = serial.PARITY_NONE,
-                stopbits  = serial.STOPBITS_ONE,
-            )
-
-            # Some USB-serial bridges (FTDI, CP210x) tie DTR to the
-            # device's RESET line; pyrplidar clears DTR for the same
-            # reason. Harmless if DTR isn't wired to anything.
-            self._serial.dtr = False
-            self._serial.rts = False
-
-            # If the user just power-cycled the lidar, it may still be
-            # booting and streaming its ASCII banner. Wait for the line
-            # to actually settle before we start sending commands.
-            time.sleep(1.0)
-
-            # Bring the device to a known-quiescent state.
-            #
-            # We deliberately do NOT send CMD_RESET here. On the S2,
-            # RESET triggers an ASCII boot banner that begins anywhere
-            # from 200 ms to 1 s after the command and lasts a few
-            # hundred ms — the gap before the first banner byte is long
-            # enough that any drain loop will think the line is already
-            # quiet and exit, after which the banner arrives mid-way
-            # through the next descriptor read (giving "P ", " S" etc.
-            # as the failed sync bytes).
-            #
-            # CMD_STOP has no banner, but it can be ignored when it
-            # lands inside the lidar's UART RX state for a scan packet,
-            # and even when it's honoured the S2 keeps emitting bytes
-            # already queued in its TX FIFO for up to ~100 ms. We send
-            # STOP a few times to defeat the first failure mode, and
-            # use a long quiet window in the drain to defeat the
-            # second — only return once the wire stays silent.
-            for _ in range(3):
-                self._send_command(CMD_STOP)
-                time.sleep(0.05)
-
-            self._serial.reset_input_buffer()
-            self._serial.reset_output_buffer()
-
-            drained = self._drain_until_quiet(
-                max_seconds=2.0, quiet_window=0.4,
-            )
-            if drained:
-                log.debug("Drained %d stale bytes before handshake", drained)
-
-            # verify it is alive
-            info   = self._get_info()
-            health = self._get_health()
-
+            self._serial = self._open_port()
+            self._quiesce_device()
+            info   = self._exchange_info()
+            health = self._exchange_health()
             self._connected = True
-            health_label = (
-                ["Good", "Warning", "Error"][health]
-                if isinstance(health, int) and 0 <= health <= 2
-                else str(health)
-            )
-            log.info(
-                "RPLidar connected — model=%s firmware=%s.%s health=%s",
-                info.get("model", "?"),
-                info.get("fw_major", "?"),
-                info.get("fw_minor", "?"),
-                health_label,
-            )
-
-            if health == HEALTH_ERROR:
+            self._log_connected(info, health)
+            if health == proto.Health.ERROR:
                 raise RuntimeError(
                     "RPLidar reports ERROR health status. "
                     "Power cycle the sensor and try again."
                 )
-
         except serial.SerialException as exc:
             self._connected = False
+            raise RuntimeError(f"Cannot open {self._port}: {exc}") from exc
+
+    def _open_port(self) -> serial.Serial:
+        s = serial.Serial(
+            port      = self._port,
+            baudrate  = self._baudrate,
+            timeout   = self._timeout_s,
+            bytesize  = serial.EIGHTBITS,
+            parity    = serial.PARITY_NONE,
+            stopbits  = serial.STOPBITS_ONE,
+        )
+        # Some FTDI/CP210x adapters tie DTR to the lidar's RESET line;
+        # pyrplidar clears DTR for the same reason. Harmless if unwired.
+        s.dtr = False
+        s.rts = False
+        time.sleep(_Timing.SETTLE_AFTER_OPEN_S)
+        return s
+
+    def _quiesce_device(self) -> None:
+        """Stop any leftover scan stream and wait for the wire to go silent."""
+        for _ in range(_Timing.STOP_REPEAT):
+            self._write(proto.encode_command(proto.Command.STOP))
+            time.sleep(_Timing.STOP_GAP_S)
+        assert self._serial is not None
+        self._serial.reset_input_buffer()
+        self._serial.reset_output_buffer()
+        drained = self._drain_until_quiet(
+            _Timing.DRAIN_MAX_S, _Timing.DRAIN_QUIET_S,
+        )
+        if drained:
+            log.debug("Drained %d stale bytes before handshake", drained)
+
+    def _exchange_info(self) -> Optional[proto.DeviceInfo]:
+        self._write(proto.encode_command(proto.Command.GET_INFO))
+        desc = proto.read_descriptor(self._read_byte)
+        log.debug(
+            "Info descriptor: form=%s len=%d type=0x%02X",
+            desc.form, desc.data_len, desc.data_type,
+        )
+        raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
+        if len(raw) < desc.data_len:
+            log.debug(
+                "Info payload short: %d/%d bytes (raw=%s)",
+                len(raw), desc.data_len, raw.hex(),
+            )
+        return proto.parse_info_payload(raw)
+
+    def _exchange_health(self) -> proto.Health:
+        self._write(proto.encode_command(proto.Command.GET_HEALTH))
+        desc = proto.read_descriptor(self._read_byte)
+        log.debug(
+            "Health descriptor: form=%s len=%d type=0x%02X",
+            desc.form, desc.data_len, desc.data_type,
+        )
+        raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
+        return proto.parse_health_payload(raw)
+
+    def _log_connected(
+        self,
+        info  : Optional[proto.DeviceInfo],
+        health: proto.Health,
+    ) -> None:
+        if info is None:
+            log.info(
+                "RPLidar connected — info unavailable, health=%s",
+                health.name,
+            )
+        else:
+            log.info(
+                "RPLidar connected — model=%d firmware=%d.%d hardware=%d health=%s",
+                info.model, info.fw_major, info.fw_minor, info.hardware,
+                health.name,
+            )
+
+    def _safe_disconnect(self) -> None:
+        try:
+            if self._serial and self._serial.is_open:
+                self._write(proto.encode_command(proto.Command.STOP))
+                time.sleep(_Timing.STOP_DRAIN_S)
+                self._serial.close()
+        except Exception:
+            pass
+        finally:
+            self._serial    = None
+            self._connected = False
+
+    # ----- Scan reading ---------------------------------------------------
+
+    def _read_one_scan(self) -> LidarScan:
+        if not self._connected or self._serial is None:
+            raise RuntimeError("Not connected")
+
+        self._write(proto.encode_command(proto.Command.SCAN))
+        desc = proto.read_descriptor(self._read_byte)
+        if desc.data_type != proto.DataType.SCAN:
             raise RuntimeError(
-                f"Cannot open {self._port}: {exc}"
-            ) from exc
+                f"Unexpected scan response type: 0x{desc.data_type:02X}"
+            )
+
+        points  : list[RawScanPoint] = []
+        started : bool = False
+        ts_ns   : int  = 0
+
+        while True:
+            raw = self._serial.read(proto.SCAN_PACKET_LEN)
+            if len(raw) < proto.SCAN_PACKET_LEN:
+                raise RuntimeError(
+                    f"Short scan read: got {len(raw)} bytes, "
+                    f"expected {proto.SCAN_PACKET_LEN}"
+                )
+
+            try:
+                m = proto.parse_scan_packet(raw)
+            except proto.ProtocolError:
+                self._serial.reset_input_buffer()
+                raise
+
+            if m.new_revolution:
+                if started and points:
+                    self._write(proto.encode_command(proto.Command.STOP))
+                    time.sleep(_Timing.STOP_DRAIN_S)
+                    self._serial.reset_input_buffer()
+                    self._scan_id += 1
+                    return LidarScan(
+                        header  = Header(
+                            timestamp_ns = ts_ns,
+                            sensor_id    = self.SENSOR_ID,
+                            frame_id     = self.FRAME_ID,
+                            source       = SensorSource.LIDAR,
+                        ),
+                        points  = points,
+                        scan_id = self._scan_id,
+                    )
+                started = True
+                ts_ns   = now_ns()
+                points  = []
+
+            if started and m.quality > 0 and m.distance_m > 0:
+                points.append(RawScanPoint(
+                    angle_deg  = m.angle_deg,
+                    distance_m = m.distance_m,
+                    quality    = m.quality,
+                ))
+
+    # ----- Low-level I/O helpers ------------------------------------------
+
+    def _write(self, payload: bytes) -> None:
+        assert self._serial is not None
+        self._serial.write(payload)
+        self._serial.flush()
+
+    def _read_byte(self) -> Optional[int]:
+        """Read one byte. Returns the byte value or None if no byte
+        arrived within the port-level timeout. Used as the input source
+        for `protocol.read_descriptor`."""
+        assert self._serial is not None
+        b = self._serial.read(1)
+        return b[0] if b else None
+
+    def _read_payload(self, expected: int, max_seconds: float) -> bytes:
+        """Read up to `expected` bytes within `max_seconds` wall-clock.
+
+        Polls `in_waiting` rather than blocking on `serial.read(N)`:
+        `read(N)` would otherwise block the full port-level timeout
+        (3 s) when fewer bytes arrive than requested, voiding the
+        wall-clock budget.
+        """
+        assert self._serial is not None
+        deadline = time.monotonic() + max_seconds
+        buf      = bytearray()
+        while len(buf) < expected and time.monotonic() < deadline:
+            n = self._serial.in_waiting
+            if n:
+                buf.extend(self._serial.read(min(n, expected - len(buf))))
+            else:
+                time.sleep(_Timing.POLL_INTERVAL_S)
+        return bytes(buf)
 
     def _drain_until_quiet(
         self,
-        max_seconds  : float = 2.0,
-        quiet_window : float = 0.4,
+        max_seconds  : float,
+        quiet_window : float,
     ) -> int:
-        """Discard incoming bytes until the line stays silent for
-        `quiet_window` seconds (or `max_seconds` total has elapsed).
-        Returns the number of bytes drained — non-zero means the
-        device was still streaming when we connected.
-
-        The quiet window must be longer than the lidar's worst-case
-        gap between consecutive scan-packet bursts, otherwise it can
-        false-trigger between bursts and exit while the device is
-        still streaming. ~400 ms is comfortable for the S2."""
-        start       = time.monotonic()
-        deadline    = start + max_seconds
-        last_byte   = start
-        drained     = 0
+        """Drain incoming bytes until the line stays silent for
+        `quiet_window` seconds (or `max_seconds` total). Returns
+        bytes-drained — non-zero means the device was still streaming."""
+        assert self._serial is not None
+        start     = time.monotonic()
+        deadline  = start + max_seconds
+        last_byte = start
+        drained   = 0
         while time.monotonic() < deadline:
             n = self._serial.in_waiting
             if n:
@@ -494,269 +376,9 @@ class RPLidarDriver:
             elif time.monotonic() - last_byte >= quiet_window:
                 return drained
             else:
-                time.sleep(0.005)
-
+                time.sleep(_Timing.POLL_INTERVAL_S)
         log.warning(
             "Lidar line never went silent for %.2fs (drained %d bytes in %.2fs)",
             quiet_window, drained, max_seconds,
         )
         return drained
-
-    def _safe_disconnect(self) -> None:
-        """Stop motor and close port without raising."""
-        try:
-            if self._serial and self._serial.is_open:
-                self._send_command(CMD_STOP)
-                time.sleep(0.02)
-                self._serial.close()
-        except Exception:
-            pass
-        finally:
-            self._serial    = None
-            self._connected = False
-
-    # ------------------------------------------------------------------
-    # Scan reading
-    # ------------------------------------------------------------------
-
-    def _read_one_scan(self) -> LidarScan:
-        """
-        Start scan, collect one full 360° rotation, stop.
-
-        The S2 sends scan packets continuously once CMD_SCAN is sent.
-        Each packet is 5 bytes. We collect packets until we detect
-        the start of a new rotation (start_bit flips to 1 on the
-        first packet of each new revolution).
-        """
-        if not self._connected or not self._serial:
-            raise RuntimeError("Not connected")
-
-        # send scan command and read the response descriptor
-        self._send_command(CMD_SCAN)
-        descriptor = self._read_descriptor()
-
-        if descriptor["type"] != 0x81:
-            raise RuntimeError(
-                f"Unexpected response type: 0x{descriptor['type']:02X}"
-            )
-
-        # collect one full rotation
-        points    : list[RawScanPoint] = []
-        started   : bool = False
-        ts_ns     : int  = 0
-
-        while True:
-            raw = self._serial.read(SCAN_RESP_LEN)
-            if len(raw) < SCAN_RESP_LEN:
-                raise RuntimeError(
-                    f"Short read: got {len(raw)} bytes, expected {SCAN_RESP_LEN}"
-                )
-
-            quality, angle_lo, angle_hi, dist_lo, dist_hi = raw
-
-            # start_bit is bit 0 of the first byte
-            # new_scan_bit is bit 1 of the first byte
-            start_bit    = quality & 0x01
-            new_scan_bit = (quality >> 1) & 0x01
-            quality_val  = quality >> 2
-
-            # check_bit must be 1 — sanity check
-            check_bit = angle_lo & 0x01
-            if check_bit != 1:
-                # lost sync — flush and try again
-                self._serial.reset_input_buffer()
-                raise RuntimeError("Lost sync — check_bit not set")
-
-            angle_q6 = ((angle_hi << 7) | (angle_lo >> 1))
-            angle_deg = angle_q6 / 64.0
-
-            dist_q2   = (dist_hi << 8) | dist_lo
-            dist_m    = (dist_q2 / 4.0) / 1000.0   # mm → m
-
-            if start_bit and new_scan_bit:
-                # beginning of a new revolution
-                if started and points:
-                    # we have a complete scan — stop and return it
-                    self._send_command(CMD_STOP)
-                    time.sleep(0.02)
-                    self._serial.reset_input_buffer()
-                    self._scan_id += 1
-                    return LidarScan(
-                        header=Header(
-                            timestamp_ns = ts_ns,
-                            sensor_id    = self.SENSOR_ID,
-                            frame_id     = self.FRAME_ID,
-                            source       = SensorSource.LIDAR,
-                        ),
-                        points  = points,
-                        scan_id = self._scan_id,
-                    )
-                # start collecting
-                started = True
-                ts_ns   = now_ns()   # timestamp at start of this revolution
-                points  = []
-
-            if started and quality_val > 0 and dist_m > 0:
-                points.append(RawScanPoint(
-                    angle_deg  = angle_deg,
-                    distance_m = dist_m,
-                    quality    = quality_val,
-                ))
-
-    # ------------------------------------------------------------------
-    # Low-level protocol helpers
-    # ------------------------------------------------------------------
-
-    def _send_command(self, cmd: int) -> None:
-        """Send a no-payload command to the sensor."""
-        self._serial.write(bytes([SYNC_BYTE, cmd]))
-        self._serial.flush()
-
-    def _read_descriptor(self) -> dict:
-        """
-        Read a response descriptor. Supports two on-the-wire forms:
-
-          1. Legacy 7-byte: 0xA5 0x5A | size(30b)+mode(2b) | type
-             — used by RPLidar A1/A2/S1 and the public protocol spec.
-
-          2. S2 compact 4-byte: 0xA5 | size_lo | size_hi | type
-             — emitted by S2 firmware for at least GET_INFO and
-             GET_HEALTH. Legacy drivers like rplidar-roboticia fail
-             on this form ("descriptor length mismatch") because they
-             demand 0x5A as the second byte.
-
-        We scan up to MAX_SCAN bytes for a leading 0xA5 to tolerate
-        stray pre-sync bytes from a previous truncated response,
-        then branch on the next byte to decide which form to parse.
-        """
-        MAX_SCAN = 64
-        scanned  = 0
-        seen     : list[int] = []
-        while scanned < MAX_SCAN:
-            b = self._serial.read(1)
-            if not b:
-                raise RuntimeError(
-                    f"Descriptor read timeout after {scanned} bytes — "
-                    f"got {[f'0x{x:02X}' for x in seen]}"
-                )
-            scanned += 1
-            seen.append(b[0])
-            if b[0] != SYNC_BYTE:
-                continue
-
-            b2 = self._serial.read(1)
-            if not b2:
-                raise RuntimeError(
-                    f"Descriptor truncated after 0xA5 — "
-                    f"got {[f'0x{x:02X}' for x in seen]}"
-                )
-            scanned += 1
-            seen.append(b2[0])
-
-            if b2[0] == SYNC_BYTE2:
-                # Legacy 7-byte form.
-                rest = self._serial.read(5)
-                if len(rest) < 5:
-                    raise RuntimeError(
-                        f"Legacy descriptor truncated — got "
-                        f"{[f'0x{x:02X}' for x in seen]} "
-                        f"+ {[f'0x{x:02X}' for x in rest]}"
-                    )
-                packed    = struct.unpack_from("<I", rest, 0)[0]
-                data_len  = packed & 0x3FFFFFFF
-                send_mode = (packed >> 30) & 0x03
-                data_type = rest[4]
-                form      = "legacy"
-            else:
-                # S2 compact 4-byte form. b2 is size_lo; read size_hi
-                # and type next.
-                rest = self._serial.read(2)
-                if len(rest) < 2:
-                    raise RuntimeError(
-                        f"S2 compact descriptor truncated — got "
-                        f"{[f'0x{x:02X}' for x in seen]} "
-                        f"+ {[f'0x{x:02X}' for x in rest]}"
-                    )
-                data_len  = b2[0] | (rest[0] << 8)
-                send_mode = 0
-                data_type = rest[1]
-                form      = "s2-compact"
-
-            if scanned > 2:
-                log.debug(
-                    "Descriptor sync found after skipping %d stray byte(s)",
-                    scanned - 2,
-                )
-            log.debug(
-                "Descriptor: form=%s len=%d type=0x%02X",
-                form, data_len, data_type,
-            )
-            return {
-                "len"      : data_len,
-                "send_mode": send_mode,
-                "type"     : data_type,
-            }
-
-        raise RuntimeError(
-            f"No descriptor sync (0xA5) within {MAX_SCAN} bytes — "
-            f"got {[f'0x{x:02X}' for x in seen]}"
-        )
-
-    def _read_payload(
-        self,
-        expected   : int,
-        max_seconds: float = 0.5,
-    ) -> bytes:
-        """Read up to `expected` bytes within `max_seconds`. Used for
-        command payloads (GET_INFO, GET_HEALTH). Unlike a single
-        `serial.read(N)` call, this gives up early instead of blocking
-        the full per-read timeout when the device sends fewer bytes
-        than the descriptor advertised — which some S2 firmware
-        revisions do for the info payload."""
-        deadline = time.monotonic() + max_seconds
-        buf      = bytearray()
-        while len(buf) < expected and time.monotonic() < deadline:
-            chunk = self._serial.read(expected - len(buf))
-            if chunk:
-                buf.extend(chunk)
-            else:
-                time.sleep(0.005)
-        return bytes(buf)
-
-    def _get_info(self) -> dict:
-        """Get device info — model, firmware version, serial number.
-
-        Tolerates short payloads: some S2 firmware variants advertise
-        20 bytes in the descriptor but actually send fewer. We accept
-        whatever arrives and parse what we can."""
-        self._send_command(CMD_GET_INFO)
-        descriptor = self._read_descriptor()
-        raw = self._read_payload(descriptor["len"], max_seconds=0.5)
-
-        if len(raw) < descriptor["len"]:
-            log.debug(
-                "Info payload short: %d/%d bytes (raw=%s)",
-                len(raw), descriptor["len"], raw.hex(),
-            )
-
-        if len(raw) < 4:
-            return {}
-
-        return {
-            "model"    : raw[0],
-            "fw_minor" : raw[1],
-            "fw_major" : raw[2],
-            "hardware" : raw[3],
-            "serial"   : raw[4:].hex(),
-        }
-
-    def _get_health(self) -> int:
-        """Get health status. Returns 0=Good, 1=Warning, 2=Error."""
-        self._send_command(CMD_GET_HEALTH)
-        descriptor = self._read_descriptor()
-        raw = self._read_payload(descriptor["len"], max_seconds=0.5)
-
-        if len(raw) < 1:
-            return HEALTH_ERROR
-
-        return raw[0]   # 0=Good, 1=Warning, 2=Error
