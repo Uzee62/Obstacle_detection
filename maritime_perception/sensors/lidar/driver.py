@@ -395,6 +395,12 @@ class RPLidarDriver:
                 stopbits  = serial.STOPBITS_ONE,
             )
 
+            # Some USB-serial bridges (FTDI, CP210x) tie DTR to the
+            # device's RESET line; pyrplidar clears DTR for the same
+            # reason. Harmless if DTR isn't wired to anything.
+            self._serial.dtr = False
+            self._serial.rts = False
+
             # Bring the device to a known-quiescent state.
             #
             # We deliberately do NOT send CMD_RESET here. On the S2,
@@ -404,18 +410,27 @@ class RPLidarDriver:
             # enough that any drain loop will think the line is already
             # quiet and exit, after which the banner arrives mid-way
             # through the next descriptor read (giving "P ", " S" etc.
-            # as the failed sync bytes). CMD_STOP has no banner and is
-            # enough to silence a scan stream left running by a previous
-            # session. Two STOPs catch the case where a scan packet was
-            # already in transit when the first STOP was processed.
-            self._send_command(CMD_STOP)
-            time.sleep(0.1)
+            # as the failed sync bytes).
+            #
+            # CMD_STOP has no banner, but it can be ignored when it
+            # lands inside the lidar's UART RX state for a scan packet,
+            # and even when it's honoured the S2 keeps emitting bytes
+            # already queued in its TX FIFO for up to ~100 ms. We send
+            # STOP a few times to defeat the first failure mode, and
+            # use a long quiet window in the drain to defeat the
+            # second — only return once the wire stays silent.
+            for _ in range(3):
+                self._send_command(CMD_STOP)
+                time.sleep(0.05)
+
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
 
-            self._send_command(CMD_STOP)
-            time.sleep(0.05)
-            self._drain_until_quiet(max_seconds=0.5, quiet_window=0.15)
+            drained = self._drain_until_quiet(
+                max_seconds=2.0, quiet_window=0.4,
+            )
+            if drained:
+                log.debug("Drained %d stale bytes before handshake", drained)
 
             # verify it is alive
             info   = self._get_info()
@@ -450,22 +465,37 @@ class RPLidarDriver:
     def _drain_until_quiet(
         self,
         max_seconds  : float = 2.0,
-        quiet_window : float = 0.1,
-    ) -> None:
+        quiet_window : float = 0.4,
+    ) -> int:
         """Discard incoming bytes until the line stays silent for
-        `quiet_window` seconds, or `max_seconds` total has elapsed."""
-        deadline  = time.monotonic() + max_seconds
-        last_byte = time.monotonic()
+        `quiet_window` seconds (or `max_seconds` total has elapsed).
+        Returns the number of bytes drained — non-zero means the
+        device was still streaming when we connected.
+
+        The quiet window must be longer than the lidar's worst-case
+        gap between consecutive scan-packet bursts, otherwise it can
+        false-trigger between bursts and exit while the device is
+        still streaming. ~400 ms is comfortable for the S2."""
+        start       = time.monotonic()
+        deadline    = start + max_seconds
+        last_byte   = start
+        drained     = 0
         while time.monotonic() < deadline:
             n = self._serial.in_waiting
             if n:
                 self._serial.read(n)
+                drained  += n
                 last_byte = time.monotonic()
             elif time.monotonic() - last_byte >= quiet_window:
-                break
+                return drained
             else:
-                time.sleep(0.01)
-        self._serial.reset_input_buffer()
+                time.sleep(0.005)
+
+        log.warning(
+            "Lidar line never went silent for %.2fs (drained %d bytes in %.2fs)",
+            quiet_window, drained, max_seconds,
+        )
+        return drained
 
     def _safe_disconnect(self) -> None:
         """Stop motor and close port without raising."""
