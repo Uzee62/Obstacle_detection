@@ -1,62 +1,55 @@
 """sensors/lidar/driver.py
 
-Slamtec RPLidar S-series hardware driver.
+RPLidar driver — thin subprocess client over the Slamtec C++ SDK.
 
-Owns the serial port lifecycle and walks the device through
-    open → STOP/drain handshake → SCAN → one revolution → STOP.
-Auto-reconnects read errors up to `max_reconnect_attempts`.
+The on-wire protocol (serial port, descriptors, scan packets, reconnect)
+is owned by `tools/lidar_publisher`, a small C++ binary linked against
+the official Slamtec SDK. This Python class spawns it and reads scans
+from its stdout in a simple line-based format:
 
-The on-wire protocol (descriptor parsing, command encoding,
-scan-packet decoding) lives in `protocol.py`; this module is
-intentionally I/O and state-machine only.
+    SCAN <monotonic_ns>
+    <angle_deg> <distance_m> <quality>
+    ...
+    END
+
+The subprocess boundary buys us:
+  - Crash isolation — a segfault in the SDK doesn't take down perception.
+  - Trivial debugging — the publisher binary runs standalone.
+  - No FFI / ctypes / shared-memory complexity in Python.
+
+The public surface (`RPLidarDriver`, `LidarScan`, `RawScanPoint`,
+`SENSOR_ID`, `FRAME_ID`) is identical to the previous direct-serial
+implementation, so the rest of the pipeline (sensor_thread, pipeline,
+preprocessor, main) needs no edits.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import threading
 import time
 from dataclasses import dataclass
-from typing import Final, Optional
+from pathlib import Path
+from typing import IO, Optional
 
-import serial
-
-from maritime_perception.models.common import Header, SensorSource, now_ns
-from maritime_perception.sensors.lidar import protocol as proto
+from maritime_perception.models.common import Header, SensorSource
 
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Tuning constants
-#
-# These are wire-level device timings — they live with the driver, not in
-# vessel YAML. If you tweak one, make sure the comment still explains why.
-# ---------------------------------------------------------------------------
-
-class _Timing:
-    # Time the device gets to settle after we open the port, in case it
-    # was just power-cycled. These values come from `test_lidar_dump.py`
-    # — the exact sequence we empirically observed the S2 responding to.
-    SETTLE_AFTER_OPEN_S : Final[float] = 2.0
-
-    # CMD_STOP can be ignored when it lands inside the lidar's RX state
-    # for a scan packet. Send a couple in a row with a real drain window
-    # between them, rather than a fast STOP burst.
-    STOP_REPEAT         : Final[int]   = 2
-    STOP_DRAIN_S        : Final[float] = 0.3    # gap between STOPs / post-flush
-
-    # Cap on info/health payload reads. Some S2 firmwares advertise more
-    # bytes in the descriptor than they actually send; take what arrives
-    # rather than wait out the port-level timeout.
-    PAYLOAD_READ_S      : Final[float] = 1.0
-
-    # Poll cadence for non-blocking I/O loops.
-    POLL_INTERVAL_S     : Final[float] = 0.005
+# Default location of the publisher binary, relative to the repo root.
+# Override via the `publisher_path=` constructor argument or the
+# `RPLIDAR_PUBLISHER` env var if your build lives somewhere else.
+_REPO_ROOT      = Path(__file__).resolve().parents[3]
+_DEFAULT_PUB    = _REPO_ROOT / "tools" / "lidar_publisher" / "lidar_publisher"
 
 
 # ---------------------------------------------------------------------------
-# Public data model (preprocessor.py, pipeline.py, test_pipeline.py import
-# these names directly — keep them stable)
+# Public data model — unchanged from the previous driver, downstream
+# modules (preprocessor.py, pipeline.py, test_pipeline.py) import these
+# names directly so they must stay stable.
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
@@ -82,9 +75,7 @@ class LidarScan:
 # ---------------------------------------------------------------------------
 
 class RPLidarDriver:
-    """Slamtec RPLidar (S1/S2) driver speaking the binary protocol
-    directly over PySerial. No third-party RPLidar Python library
-    required.
+    """Spawn the SDK-backed publisher and read scans from its stdout.
 
     Usage:
         driver = RPLidarDriver(port="/dev/ttyUSB0")
@@ -106,29 +97,43 @@ class RPLidarDriver:
         timeout_s              : float = 3.0,
         reconnect_delay_s      : float = 2.0,
         max_reconnect_attempts : int   = 10,
+        publisher_path         : Optional[str] = None,
     ) -> None:
         self._port            = port
         self._baudrate        = baudrate
         self._timeout_s       = timeout_s
         self._reconnect_delay = reconnect_delay_s
         self._max_attempts    = max_reconnect_attempts
-        self._serial          : Optional[serial.Serial] = None
-        self._scan_id         = 0
-        self._connected       = False
-        log.info("RPLidarDriver initialised on %s at %d baud", port, baudrate)
+
+        env_path = os.environ.get("RPLIDAR_PUBLISHER")
+        chosen   = publisher_path or env_path or str(_DEFAULT_PUB)
+        self._publisher_path  = Path(chosen)
+
+        self._proc      : Optional[subprocess.Popen] = None
+        self._stderr_thr: Optional[threading.Thread] = None
+        self._scan_id   = 0
+        self._connected = False
+        log.info(
+            "RPLidarDriver initialised — port=%s baud=%d publisher=%s",
+            port, baudrate, self._publisher_path,
+        )
 
     # ----- Public API -----------------------------------------------------
 
     def connect(self) -> None:
-        """Open serial connection and verify sensor health."""
+        """Spawn the publisher subprocess and verify it started."""
         self._connect_once()
 
     def disconnect(self) -> None:
-        """Stop scanning and close serial port."""
+        """Signal the publisher to exit and reap the subprocess."""
         self._safe_disconnect()
 
     def is_connected(self) -> bool:
-        return self._connected
+        return (
+            self._connected
+            and self._proc is not None
+            and self._proc.poll() is None
+        )
 
     def read_scan(self) -> LidarScan:
         """Read one complete 360° scan. Blocks until a full revolution
@@ -153,258 +158,132 @@ class RPLidarDriver:
                 self._connect_once()
         raise RuntimeError("RPLidar read_scan failed")
 
-    # ----- Connect / handshake --------------------------------------------
+    # ----- Subprocess lifecycle -------------------------------------------
 
     def _connect_once(self) -> None:
-        try:
-            self._serial = self._open_port()
-            self._quiesce_device()
-            info   = self._exchange_info()
-            health = self._exchange_health()
-            self._connected = True
-            self._log_connected(info, health)
-            if health == proto.Health.ERROR:
-                raise RuntimeError(
-                    "RPLidar reports ERROR health status. "
-                    "Power cycle the sensor and try again."
-                )
-        except serial.SerialException as exc:
-            self._connected = False
-            raise RuntimeError(f"Cannot open {self._port}: {exc}") from exc
-
-    def _log_connected(
-        self,
-        info  : Optional[proto.DeviceInfo],
-        health: Optional[proto.Health],
-    ) -> None:
-        health_str = health.name if health is not None else "unknown"
-        if info is None:
-            log.info(
-                "RPLidar connected — info unavailable, health=%s",
-                health_str,
+        if not self._publisher_path.exists():
+            raise RuntimeError(
+                f"Publisher binary not found at {self._publisher_path}. "
+                f"Build it first:  make -C tools/lidar_publisher  "
+                f"(requires the Slamtec SDK built at ~/rplidar_sdk)."
             )
-        else:
-            log.info(
-                "RPLidar connected — model=%d firmware=%d.%d hardware=%d health=%s",
-                info.model, info.fw_major, info.fw_minor, info.hardware,
-                health_str,
+        if not os.access(self._publisher_path, os.X_OK):
+            raise RuntimeError(
+                f"Publisher binary at {self._publisher_path} is not executable."
             )
 
-    def _open_port(self) -> serial.Serial:
-        s = serial.Serial(
-            port      = self._port,
-            baudrate  = self._baudrate,
-            timeout   = self._timeout_s,
-            bytesize  = serial.EIGHTBITS,
-            parity    = serial.PARITY_NONE,
-            stopbits  = serial.STOPBITS_ONE,
+        log.info(
+            "Spawning publisher: %s %s %d",
+            self._publisher_path, self._port, self._baudrate,
         )
-        # Some FTDI/CP210x adapters tie DTR to the lidar's RESET line;
-        # pyrplidar clears DTR for the same reason. Harmless if unwired.
-        s.dtr = False
-        s.rts = False
-        time.sleep(_Timing.SETTLE_AFTER_OPEN_S)
-        return s
-
-    def _quiesce_device(self) -> None:
-        """Bring the device to a known-quiescent state.
-
-        Sequence matches `test_lidar_dump.py` (the probe that confirmed
-        the device responds to GET_INFO): drain any pre-existing stream,
-        then STOP / drain N times, then flush, then one more drain.
-        Each drain is fixed-duration rather than quiet-window-based,
-        because we don't actually need a quiet-line guarantee — we just
-        need to consume anything sitting in the buffer.
-        """
-        assert self._serial is not None
-
-        pre = self._drain_for(_Timing.STOP_DRAIN_S)
-        for i in range(_Timing.STOP_REPEAT):
-            self._write(proto.encode_command(proto.Command.STOP))
-            extra = self._drain_for(_Timing.STOP_DRAIN_S)
-            if extra:
-                log.debug("Drained %d bytes after STOP #%d", extra, i + 1)
-
-        self._serial.reset_input_buffer()
-        self._serial.reset_output_buffer()
-        post = self._drain_for(_Timing.STOP_DRAIN_S)
-
-        if pre + post:
-            log.debug(
-                "Drained %d stale bytes before handshake (pre=%d post=%d)",
-                pre + post, pre, post,
-            )
-
-    def _drain_for(self, seconds: float) -> int:
-        """Read and discard incoming bytes for `seconds` wall-clock,
-        regardless of whether the wire is quiet. Returns bytes drained."""
-        assert self._serial is not None
-        end     = time.monotonic() + seconds
-        drained = 0
-        while time.monotonic() < end:
-            n = self._serial.in_waiting
-            if n:
-                self._serial.read(n)
-                drained += n
-            else:
-                time.sleep(_Timing.POLL_INTERVAL_S)
-        return drained
-
-    # Sanity bound on advertised payload size. The largest legitimate
-    # response (GET_INFO) is 20 bytes; anything larger means we read
-    # garbage as a descriptor and should bail instead of asking the
-    # payload reader to wait for hundreds of MB.
-    _MAX_REASONABLE_PAYLOAD = 256
-
-    def _exchange_info(self) -> Optional[proto.DeviceInfo]:
-        self._write(proto.encode_command(proto.Command.GET_INFO))
-        desc = proto.read_descriptor(self._read_byte)
-        log.debug(
-            "Info descriptor: form=%s len=%d type=0x%02X",
-            desc.form, desc.data_len, desc.data_type,
+        self._proc = subprocess.Popen(
+            [str(self._publisher_path), self._port, str(self._baudrate)],
+            stdin    = subprocess.PIPE,
+            stdout   = subprocess.PIPE,
+            stderr   = subprocess.PIPE,
+            bufsize  = 1,            # line-buffered text stream
+            text     = True,
+            close_fds= True,
         )
-        if (desc.data_type != proto.DataType.INFO
-                or desc.data_len > self._MAX_REASONABLE_PAYLOAD):
-            log.warning(
-                "GET_INFO returned bogus descriptor (form=%s len=%d "
-                "type=0x%02X); proceeding without device info",
-                desc.form, desc.data_len, desc.data_type,
-            )
-            return None
-        raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
-        if len(raw) < desc.data_len:
-            log.debug(
-                "Info payload short: %d/%d bytes (raw=%s)",
-                len(raw), desc.data_len, raw.hex(),
-            )
-        return proto.parse_info_payload(raw)
 
-    def _exchange_health(self) -> Optional[proto.Health]:
-        """Returns None if the device fails to respond meaningfully —
-        some S2 firmwares ignore GET_HEALTH while still being usable
-        for scans. Real ERROR status is still returned as Health.ERROR."""
-        self._write(proto.encode_command(proto.Command.GET_HEALTH))
-        try:
-            desc = proto.read_descriptor(self._read_byte)
-        except proto.ProtocolError as exc:
-            log.warning("Health descriptor read failed: %s", exc)
-            return None
-        log.debug(
-            "Health descriptor: form=%s len=%d type=0x%02X",
-            desc.form, desc.data_len, desc.data_type,
+        # Forward publisher's stderr into the Python logger asynchronously
+        # so we see device-info / health / scan-start messages.
+        self._stderr_thr = threading.Thread(
+            target = self._forward_stderr,
+            args   = (self._proc.stderr,),
+            daemon = True,
+            name   = "lidar-pub-stderr",
         )
-        if (desc.data_type != proto.DataType.HEALTH
-                or desc.data_len > self._MAX_REASONABLE_PAYLOAD):
-            log.warning(
-                "GET_HEALTH returned bogus descriptor (form=%s len=%d "
-                "type=0x%02X); treating health as unknown",
-                desc.form, desc.data_len, desc.data_type,
-            )
-            return None
-        raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
-        return proto.parse_health_payload(raw)
+        self._stderr_thr.start()
 
-    def _safe_disconnect(self) -> None:
+        self._connected = True
+
+    def _forward_stderr(self, stream: IO[str]) -> None:
         try:
-            if self._serial and self._serial.is_open:
-                self._write(proto.encode_command(proto.Command.STOP))
-                time.sleep(_Timing.STOP_DRAIN_S)
-                self._serial.close()
+            for line in stream:
+                line = line.rstrip()
+                if line:
+                    log.info("[publisher] %s", line)
         except Exception:
             pass
-        finally:
-            self._serial    = None
-            self._connected = False
 
-    # ----- Scan reading ---------------------------------------------------
+    def _safe_disconnect(self) -> None:
+        proc = self._proc
+        self._connected = False
+        self._proc      = None
+        if proc is None:
+            return
+        try:
+            # Closing stdin asks the publisher to exit cleanly.
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=self._timeout_s)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+        except Exception as exc:
+            log.warning("Disconnect cleanup error: %s", exc)
+
+    # ----- Scan parsing ---------------------------------------------------
 
     def _read_one_scan(self) -> LidarScan:
-        if not self._connected or self._serial is None:
+        if (not self._connected
+                or self._proc is None
+                or self._proc.stdout is None):
             raise RuntimeError("Not connected")
-
-        self._write(proto.encode_command(proto.Command.SCAN))
-        desc = proto.read_descriptor(self._read_byte)
-        if desc.data_type != proto.DataType.SCAN:
+        if self._proc.poll() is not None:
             raise RuntimeError(
-                f"Unexpected scan response type: 0x{desc.data_type:02X}"
+                f"Publisher exited (code={self._proc.returncode})"
             )
 
-        points  : list[RawScanPoint] = []
-        started : bool = False
-        ts_ns   : int  = 0
+        header = self._proc.stdout.readline()
+        if not header:
+            raise RuntimeError("Publisher stdout closed")
+        header = header.strip()
+        if not header.startswith("SCAN "):
+            raise RuntimeError(f"Expected SCAN header, got: {header!r}")
+        try:
+            ts_ns = int(header.split()[1])
+        except (IndexError, ValueError) as exc:
+            raise RuntimeError(f"Malformed SCAN header: {header!r}") from exc
 
+        points: list[RawScanPoint] = []
         while True:
-            raw = self._serial.read(proto.SCAN_PACKET_LEN)
-            if len(raw) < proto.SCAN_PACKET_LEN:
-                raise RuntimeError(
-                    f"Short scan read: got {len(raw)} bytes, "
-                    f"expected {proto.SCAN_PACKET_LEN}"
-                )
-
+            line = self._proc.stdout.readline()
+            if not line:
+                raise RuntimeError("Publisher stdout closed mid-scan")
+            line = line.rstrip()
+            if line == "END":
+                break
             try:
-                m = proto.parse_scan_packet(raw)
-            except proto.ProtocolError:
-                self._serial.reset_input_buffer()
-                raise
-
-            if m.new_revolution:
-                if started and points:
-                    self._write(proto.encode_command(proto.Command.STOP))
-                    time.sleep(_Timing.STOP_DRAIN_S)
-                    self._serial.reset_input_buffer()
-                    self._scan_id += 1
-                    return LidarScan(
-                        header  = Header(
-                            timestamp_ns = ts_ns,
-                            sensor_id    = self.SENSOR_ID,
-                            frame_id     = self.FRAME_ID,
-                            source       = SensorSource.LIDAR,
-                        ),
-                        points  = points,
-                        scan_id = self._scan_id,
-                    )
-                started = True
-                ts_ns   = now_ns()
-                points  = []
-
-            if started and m.quality > 0 and m.distance_m > 0:
+                angle_s, dist_s, qual_s = line.split()
                 points.append(RawScanPoint(
-                    angle_deg  = m.angle_deg,
-                    distance_m = m.distance_m,
-                    quality    = m.quality,
+                    angle_deg  = float(angle_s),
+                    distance_m = float(dist_s),
+                    quality    = int(qual_s),
                 ))
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Malformed scan point: {line!r}"
+                ) from exc
 
-    # ----- Low-level I/O helpers ------------------------------------------
-
-    def _write(self, payload: bytes) -> None:
-        assert self._serial is not None
-        self._serial.write(payload)
-        self._serial.flush()
-
-    def _read_byte(self) -> Optional[int]:
-        """Read one byte. Returns the byte value or None if no byte
-        arrived within the port-level timeout. Used as the input source
-        for `protocol.read_descriptor`."""
-        assert self._serial is not None
-        b = self._serial.read(1)
-        return b[0] if b else None
-
-    def _read_payload(self, expected: int, max_seconds: float) -> bytes:
-        """Read up to `expected` bytes within `max_seconds` wall-clock.
-
-        Polls `in_waiting` rather than blocking on `serial.read(N)`:
-        `read(N)` would otherwise block the full port-level timeout
-        (3 s) when fewer bytes arrive than requested, voiding the
-        wall-clock budget.
-        """
-        assert self._serial is not None
-        deadline = time.monotonic() + max_seconds
-        buf      = bytearray()
-        while len(buf) < expected and time.monotonic() < deadline:
-            n = self._serial.in_waiting
-            if n:
-                buf.extend(self._serial.read(min(n, expected - len(buf))))
-            else:
-                time.sleep(_Timing.POLL_INTERVAL_S)
-        return bytes(buf)
-
+        self._scan_id += 1
+        return LidarScan(
+            header  = Header(
+                timestamp_ns = ts_ns,
+                sensor_id    = self.SENSOR_ID,
+                frame_id     = self.FRAME_ID,
+                source       = SensorSource.LIDAR,
+            ),
+            points  = points,
+            scan_id = self._scan_id,
+        )
