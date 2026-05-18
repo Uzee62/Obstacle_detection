@@ -610,28 +610,52 @@ class RPLidarDriver:
     def _read_descriptor(self) -> dict:
         """
         Read a 7-byte response descriptor.
-        Format: 0xA5 0x5A | len(4 bytes) | send_mode | data_type
+        Format: 0xA5 0x5A | size(30 bits) + send_mode(2 bits) | data_type
+
+        We scan the stream for the 0xA5 0x5A sync rather than assume
+        it sits at byte 0. Some S2 firmware revisions emit a trailing
+        byte or two after the documented-length payload of a previous
+        response (e.g. GET_INFO), and those leftovers would otherwise
+        be read as the next descriptor's first bytes and cause a
+        "Bad descriptor sync" failure. Tolerating up to MAX_SCAN
+        pre-sync bytes resyncs cleanly without us having to know each
+        firmware's exact payload size.
         """
-        raw = self._serial.read(DESCRIPTOR_LEN)
-        if len(raw) < DESCRIPTOR_LEN:
-            raise RuntimeError(
-                f"Descriptor read failed: got {len(raw)} bytes"
-            )
+        MAX_SCAN = 64
+        prev     = -1
+        scanned  = 0
+        while scanned < MAX_SCAN:
+            b = self._serial.read(1)
+            if not b:
+                raise RuntimeError(
+                    f"Descriptor read timeout after {scanned} bytes"
+                )
+            scanned += 1
+            if prev == SYNC_BYTE and b[0] == SYNC_BYTE2:
+                rest = self._serial.read(DESCRIPTOR_LEN - 2)
+                if len(rest) < DESCRIPTOR_LEN - 2:
+                    raise RuntimeError(
+                        f"Descriptor truncated: got {len(rest) + 2} bytes"
+                    )
+                packed    = struct.unpack_from("<I", rest, 0)[0]
+                data_len  = packed & 0x3FFFFFFF
+                send_mode = (packed >> 30) & 0x03
+                data_type = rest[4]
+                if scanned > 1:
+                    log.debug(
+                        "Descriptor sync found after skipping %d stray byte(s)",
+                        scanned - 1,
+                    )
+                return {
+                    "len"      : data_len,
+                    "send_mode": send_mode,
+                    "type"     : data_type,
+                }
+            prev = b[0]
 
-        if raw[0] != SYNC_BYTE or raw[1] != SYNC_BYTE2:
-            raise RuntimeError(
-                f"Bad descriptor sync: 0x{raw[0]:02X} 0x{raw[1]:02X}"
-            )
-
-        data_len  = struct.unpack_from("<I", raw, 2)[0] & 0x3FFFFFFF
-        send_mode = (struct.unpack_from("<I", raw, 2)[0] >> 30) & 0x03
-        data_type = raw[6]
-
-        return {
-            "len"      : data_len,
-            "send_mode": send_mode,
-            "type"     : data_type,
-        }
+        raise RuntimeError(
+            f"No descriptor sync (0xA5 0x5A) within {MAX_SCAN} bytes"
+        )
 
     def _get_info(self) -> dict:
         """Get device info — model, firmware version, serial number."""
