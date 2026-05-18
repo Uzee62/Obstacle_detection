@@ -112,14 +112,35 @@ int main(int argc, const char *argv[]) {
     }
 
     drv->setMotorSpeed();                          // default RPM
-    if (SL_IS_FAIL((res = drv->startScan(false, true)))) {
-        fprintf(stderr, "startScan failed: 0x%08x\n", res);
-        drv->stop();
-        drv->disconnect();
-        delete drv;
-        return 1;
+
+    // The S2 motor needs ~1–2 s to reach operating speed after a fresh
+    // port open. startScan will time out if it lands while the motor
+    // is still spinning up — see error 0x80008002. Retry in-process so
+    // we don't tear the port down and force a cold motor restart, and
+    // call stop() between attempts to clear any half-started state in
+    // the device's firmware.
+    const int    START_RETRIES_MAX = 6;
+    const useconds_t START_RETRY_GAP_US = 500 * 1000;   // 0.5 s
+    for (int attempt = 1; ; ++attempt) {
+        drv->stop();                               // clear any pending state
+        usleep(50 * 1000);                         // brief settle
+        res = drv->startScan(false, true);
+        if (SL_IS_OK(res)) {
+            fprintf(stderr, "scanning started (attempt %d)\n", attempt);
+            break;
+        }
+        fprintf(stderr,
+                "startScan failed: 0x%08x (attempt %d/%d)\n",
+                res, attempt, START_RETRIES_MAX);
+        if (attempt >= START_RETRIES_MAX) {
+            drv->stop();
+            drv->setMotorSpeed(0);
+            drv->disconnect();
+            delete drv;
+            return 1;
+        }
+        usleep(START_RETRY_GAP_US);
     }
-    fprintf(stderr, "scanning started\n");
 
     static sl_lidar_response_measurement_node_hq_t nodes[8192];
     int consecutive_failures = 0;
@@ -134,7 +155,11 @@ int main(int argc, const char *argv[]) {
         res = drv->grabScanDataHq(nodes, count);
         if (SL_IS_FAIL(res)) {
             fprintf(stderr, "grabScanDataHq failed: 0x%08x\n", res);
-            if (++consecutive_failures >= 5) {
+            // Drop the bad frame and let the SDK resync. Only give up if
+            // failures pile up — a brief streak of timeouts under load
+            // is normal on the S2 and shouldn't force a publisher restart
+            // (which costs a cold motor spin-up).
+            if (++consecutive_failures >= 10) {
                 fprintf(stderr, "too many consecutive grab failures; exiting\n");
                 break;
             }
