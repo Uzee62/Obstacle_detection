@@ -94,62 +94,62 @@ def encode_command(cmd: Command) -> bytes:
     return bytes([SYNC1, int(cmd)])
 
 
-def read_descriptor(read_byte: ByteReader, max_scan: int = 64) -> Descriptor:
+def read_descriptor(read_byte: ByteReader) -> Descriptor:
     """Read a response descriptor from a byte-at-a-time source.
 
-    Scans up to `max_scan` bytes for the leading 0xA5 to tolerate stray
-    pre-sync bytes (e.g. trailing bytes of a previous over-long response),
-    then branches on the next byte:
-        if 0x5A → legacy 7-byte form
-        else    → S2 compact 4-byte form (b2 is size_lo)
+    Two on-the-wire forms are supported, dispatched on the first byte:
+
+      1. Legacy 7-byte (first byte == 0xA5):
+           0xA5 0x5A | size30 + mode2 | type
+         Documented Slamtec protocol; used by A1/A2/S1.
+
+      2. Naked 5-byte (first byte != 0xA5):
+           size30 + mode2 | type
+         What the S2 firmware actually emits for GET_INFO / GET_HEALTH
+         responses — there is NO sync prefix. This is the format that
+         makes rplidar-roboticia fail with "descriptor length mismatch":
+         it expects 0xA5 as byte 0 and bails when it sees the size
+         field's low byte (e.g. 0x14 = 20 for info) instead.
+
+    The reader does not scan past the first byte. If the line had stray
+    pre-response bytes, the caller's drain should have handled them
+    before this is called; the descriptor's `data_type` field is the
+    caller's sanity check against parsing garbage.
     """
-    seen: list[int] = []
-    while len(seen) < max_scan:
-        b = read_byte()
-        if b is None:
+    b0 = read_byte()
+    if b0 is None:
+        raise ProtocolError("Descriptor timeout — no bytes received")
+
+    if b0 == SYNC1:
+        b1 = read_byte()
+        if b1 is None:
+            raise ProtocolError("Descriptor truncated after 0xA5")
+        if b1 != SYNC2:
             raise ProtocolError(
-                f"Descriptor timeout after {len(seen)} bytes — got {_hex(seen)}"
+                f"Expected 0x5A after 0xA5, got 0x{b1:02X}"
             )
-        seen.append(b)
-        if b != SYNC1:
-            continue
-
-        b2 = read_byte()
-        if b2 is None:
-            raise ProtocolError(
-                f"Descriptor truncated after 0xA5 — got {_hex(seen)}"
-            )
-        seen.append(b2)
-
-        if b2 == SYNC2:
-            rest = _read_n(read_byte, 5)
-            if rest is None:
-                raise ProtocolError(
-                    f"Legacy descriptor truncated — got {_hex(seen)}"
-                )
-            packed = struct.unpack("<I", bytes(rest[:4]))[0]
-            return Descriptor(
-                form      = "legacy",
-                data_len  = packed & 0x3FFFFFFF,
-                send_mode = (packed >> 30) & 0x03,
-                data_type = rest[4],
-            )
-
-        # S2 compact form: b2 is size_lo.
-        rest = _read_n(read_byte, 2)
+        rest = _read_n(read_byte, 5)
         if rest is None:
-            raise ProtocolError(
-                f"S2 compact descriptor truncated — got {_hex(seen)}"
-            )
+            raise ProtocolError("Legacy descriptor truncated")
+        packed = struct.unpack("<I", bytes(rest[:4]))[0]
         return Descriptor(
-            form      = "s2-compact",
-            data_len  = b2 | (rest[0] << 8),
-            send_mode = 0,
-            data_type = rest[1],
+            form      = "legacy",
+            data_len  = packed & 0x3FFFFFFF,
+            send_mode = (packed >> 30) & 0x03,
+            data_type = rest[4],
         )
 
-    raise ProtocolError(
-        f"No 0xA5 sync within {max_scan} bytes — got {_hex(seen)}"
+    # Naked 5-byte form: b0 is the low byte of a 4-byte little-endian
+    # (size30 + mode2) field, followed by a 1-byte data_type.
+    rest = _read_n(read_byte, 4)
+    if rest is None:
+        raise ProtocolError("Naked descriptor truncated")
+    packed = struct.unpack("<I", bytes([b0, rest[0], rest[1], rest[2]]))[0]
+    return Descriptor(
+        form      = "naked",
+        data_len  = packed & 0x3FFFFFFF,
+        send_mode = (packed >> 30) & 0x03,
+        data_type = rest[3],
     )
 
 
@@ -171,9 +171,19 @@ def parse_info_payload(raw: bytes) -> Optional[DeviceInfo]:
     )
 
 
-def parse_health_payload(raw: bytes) -> Health:
-    """Parse a GET_HEALTH payload. ERROR if truncated or out of range."""
-    if not raw or raw[0] > int(Health.ERROR):
+def parse_health_payload(raw: bytes) -> Optional[Health]:
+    """Parse a GET_HEALTH payload.
+
+    Returns None if `raw` is empty — i.e. the device didn't actually
+    respond. The caller should treat that as "health unknown", not
+    "health ERROR", since some S2 firmwares fail to answer the health
+    query at all even when the device itself is otherwise usable.
+
+    Returns Health.ERROR if the status byte is out of range (0..2).
+    """
+    if not raw:
+        return None
+    if raw[0] > int(Health.ERROR):
         return Health.ERROR
     return Health(raw[0])
 

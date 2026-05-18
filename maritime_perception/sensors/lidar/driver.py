@@ -35,26 +35,20 @@ log = logging.getLogger(__name__)
 
 class _Timing:
     # Time the device gets to settle after we open the port, in case it
-    # was just power-cycled and is still emitting its ASCII boot banner.
-    SETTLE_AFTER_OPEN_S : Final[float] = 1.0
+    # was just power-cycled. These values come from `test_lidar_dump.py`
+    # — the exact sequence we empirically observed the S2 responding to.
+    SETTLE_AFTER_OPEN_S : Final[float] = 2.0
 
     # CMD_STOP can be ignored when it lands inside the lidar's RX state
-    # for a scan packet. Send a few in a row to defeat that race.
-    STOP_REPEAT         : Final[int]   = 3
-    STOP_GAP_S          : Final[float] = 0.05
-    STOP_DRAIN_S        : Final[float] = 0.02   # short post-STOP pause
-
-    # After STOP, the device may keep emitting bytes already queued in
-    # its TX FIFO. Drain until the wire stays silent for this long. The
-    # quiet window must exceed the worst-case gap between scan-packet
-    # bursts, otherwise we false-trigger and exit mid-stream.
-    DRAIN_MAX_S         : Final[float] = 2.0
-    DRAIN_QUIET_S       : Final[float] = 0.4
+    # for a scan packet. Send a couple in a row with a real drain window
+    # between them, rather than a fast STOP burst.
+    STOP_REPEAT         : Final[int]   = 2
+    STOP_DRAIN_S        : Final[float] = 0.3    # gap between STOPs / post-flush
 
     # Cap on info/health payload reads. Some S2 firmwares advertise more
     # bytes in the descriptor than they actually send; take what arrives
     # rather than wait out the port-level timeout.
-    PAYLOAD_READ_S      : Final[float] = 0.5
+    PAYLOAD_READ_S      : Final[float] = 1.0
 
     # Poll cadence for non-blocking I/O loops.
     POLL_INTERVAL_S     : Final[float] = 0.005
@@ -178,6 +172,24 @@ class RPLidarDriver:
             self._connected = False
             raise RuntimeError(f"Cannot open {self._port}: {exc}") from exc
 
+    def _log_connected(
+        self,
+        info  : Optional[proto.DeviceInfo],
+        health: Optional[proto.Health],
+    ) -> None:
+        health_str = health.name if health is not None else "unknown"
+        if info is None:
+            log.info(
+                "RPLidar connected — info unavailable, health=%s",
+                health_str,
+            )
+        else:
+            log.info(
+                "RPLidar connected — model=%d firmware=%d.%d hardware=%d health=%s",
+                info.model, info.fw_major, info.fw_minor, info.hardware,
+                health_str,
+            )
+
     def _open_port(self) -> serial.Serial:
         s = serial.Serial(
             port      = self._port,
@@ -195,18 +207,48 @@ class RPLidarDriver:
         return s
 
     def _quiesce_device(self) -> None:
-        """Stop any leftover scan stream and wait for the wire to go silent."""
-        for _ in range(_Timing.STOP_REPEAT):
-            self._write(proto.encode_command(proto.Command.STOP))
-            time.sleep(_Timing.STOP_GAP_S)
+        """Bring the device to a known-quiescent state.
+
+        Sequence matches `test_lidar_dump.py` (the probe that confirmed
+        the device responds to GET_INFO): drain any pre-existing stream,
+        then STOP / drain N times, then flush, then one more drain.
+        Each drain is fixed-duration rather than quiet-window-based,
+        because we don't actually need a quiet-line guarantee — we just
+        need to consume anything sitting in the buffer.
+        """
         assert self._serial is not None
+
+        pre = self._drain_for(_Timing.STOP_DRAIN_S)
+        for i in range(_Timing.STOP_REPEAT):
+            self._write(proto.encode_command(proto.Command.STOP))
+            extra = self._drain_for(_Timing.STOP_DRAIN_S)
+            if extra:
+                log.debug("Drained %d bytes after STOP #%d", extra, i + 1)
+
         self._serial.reset_input_buffer()
         self._serial.reset_output_buffer()
-        drained = self._drain_until_quiet(
-            _Timing.DRAIN_MAX_S, _Timing.DRAIN_QUIET_S,
-        )
-        if drained:
-            log.debug("Drained %d stale bytes before handshake", drained)
+        post = self._drain_for(_Timing.STOP_DRAIN_S)
+
+        if pre + post:
+            log.debug(
+                "Drained %d stale bytes before handshake (pre=%d post=%d)",
+                pre + post, pre, post,
+            )
+
+    def _drain_for(self, seconds: float) -> int:
+        """Read and discard incoming bytes for `seconds` wall-clock,
+        regardless of whether the wire is quiet. Returns bytes drained."""
+        assert self._serial is not None
+        end     = time.monotonic() + seconds
+        drained = 0
+        while time.monotonic() < end:
+            n = self._serial.in_waiting
+            if n:
+                self._serial.read(n)
+                drained += n
+            else:
+                time.sleep(_Timing.POLL_INTERVAL_S)
+        return drained
 
     def _exchange_info(self) -> Optional[proto.DeviceInfo]:
         self._write(proto.encode_command(proto.Command.GET_INFO))
@@ -223,32 +265,22 @@ class RPLidarDriver:
             )
         return proto.parse_info_payload(raw)
 
-    def _exchange_health(self) -> proto.Health:
+    def _exchange_health(self) -> Optional[proto.Health]:
+        """Returns None if the device fails to respond at all — some
+        S2 firmwares ignore GET_HEALTH while still being usable for
+        scans. Real ERROR status is still returned as Health.ERROR."""
         self._write(proto.encode_command(proto.Command.GET_HEALTH))
-        desc = proto.read_descriptor(self._read_byte)
+        try:
+            desc = proto.read_descriptor(self._read_byte)
+        except proto.ProtocolError as exc:
+            log.warning("Health descriptor read failed: %s", exc)
+            return None
         log.debug(
             "Health descriptor: form=%s len=%d type=0x%02X",
             desc.form, desc.data_len, desc.data_type,
         )
         raw = self._read_payload(desc.data_len, _Timing.PAYLOAD_READ_S)
         return proto.parse_health_payload(raw)
-
-    def _log_connected(
-        self,
-        info  : Optional[proto.DeviceInfo],
-        health: proto.Health,
-    ) -> None:
-        if info is None:
-            log.info(
-                "RPLidar connected — info unavailable, health=%s",
-                health.name,
-            )
-        else:
-            log.info(
-                "RPLidar connected — model=%d firmware=%d.%d hardware=%d health=%s",
-                info.model, info.fw_major, info.fw_minor, info.hardware,
-                health.name,
-            )
 
     def _safe_disconnect(self) -> None:
         try:
@@ -354,31 +386,3 @@ class RPLidarDriver:
                 time.sleep(_Timing.POLL_INTERVAL_S)
         return bytes(buf)
 
-    def _drain_until_quiet(
-        self,
-        max_seconds  : float,
-        quiet_window : float,
-    ) -> int:
-        """Drain incoming bytes until the line stays silent for
-        `quiet_window` seconds (or `max_seconds` total). Returns
-        bytes-drained — non-zero means the device was still streaming."""
-        assert self._serial is not None
-        start     = time.monotonic()
-        deadline  = start + max_seconds
-        last_byte = start
-        drained   = 0
-        while time.monotonic() < deadline:
-            n = self._serial.in_waiting
-            if n:
-                self._serial.read(n)
-                drained  += n
-                last_byte = time.monotonic()
-            elif time.monotonic() - last_byte >= quiet_window:
-                return drained
-            else:
-                time.sleep(_Timing.POLL_INTERVAL_S)
-        log.warning(
-            "Lidar line never went silent for %.2fs (drained %d bytes in %.2fs)",
-            quiet_window, drained, max_seconds,
-        )
-        return drained
