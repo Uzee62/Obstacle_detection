@@ -89,6 +89,15 @@ int main(int argc, const char *argv[]) {
         return 1;
     }
 
+    // Soft-reset the LiDAR firmware so we start from a known idle state.
+    // Without this, a prior publisher that was SIGKILL'd leaves the device
+    // in a streaming state — the next session then either reads stale
+    // bytes (INVALID_DATA on first startScan) or never gets scan packets
+    // (OPERATION_TIMEOUT on subsequent attempts). reset() reboots the
+    // firmware; the device needs ~2 s before it accepts commands again.
+    drv->reset();
+    usleep(2000 * 1000);
+
     sl_lidar_response_device_info_t info;
     if (SL_IS_OK((res = drv->getDeviceInfo(info)))) {
         fprintf(stderr,

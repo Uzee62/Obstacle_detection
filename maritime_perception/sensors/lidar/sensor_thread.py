@@ -68,10 +68,12 @@ class LidarSensorThread(AbstractSensorPipeline):
         driver          : RPLidarDriver,
         pipeline        : LidarPerceptionPipeline,
         max_scan_gap_s  : float = 1.0,
+        startup_grace_s : float = 20.0,
     ) -> None:
         self._driver         = driver
         self._pipeline       = pipeline
         self._max_gap_s      = max_scan_gap_s
+        self._startup_grace_s = startup_grace_s
 
         # single-slot buffer — keeps only the latest result
         self._buffer         : queue.Queue[list[DetectionObservation]] = queue.Queue(maxsize=1)
@@ -82,6 +84,7 @@ class LidarSensorThread(AbstractSensorPipeline):
             daemon = True,
         )
         self._running        = False
+        self._started_at_ns  = 0
         self._last_scan_ns   = 0
         self._error_count    = 0
         self._scan_count     = 0
@@ -93,8 +96,8 @@ class LidarSensorThread(AbstractSensorPipeline):
         """Connect driver and start background thread."""
         log.info("LidarSensorThread: connecting driver ...")
         self._driver.connect()
-        self._running      = True
-        self._last_scan_ns = now_ns()
+        self._running       = True
+        self._started_at_ns = now_ns()
         self._thread.start()
         log.info("LidarSensorThread: started")
 
@@ -123,11 +126,17 @@ class LidarSensorThread(AbstractSensorPipeline):
     def is_healthy(self) -> bool:
         """
         True if thread is alive and scans are arriving on schedule.
+        During the startup grace window (before the first scan arrives)
+        the thread is considered healthy — the publisher needs several
+        seconds to warm up the motor and may retry startScan.
         """
         if not self._thread.is_alive():
             return False
         if self._last_scan_ns == 0:
-            return True   # not started yet
+            # No scan yet — give the publisher time to warm up.
+            grace_ms = self._startup_grace_s * 1000.0
+            since_start_ms = ns_to_ms(now_ns() - self._started_at_ns)
+            return since_start_ms < grace_ms
         gap_s = ns_to_ms(now_ns() - self._last_scan_ns) / 1000.0
         return gap_s < self._max_gap_s
 
@@ -143,9 +152,11 @@ class LidarSensorThread(AbstractSensorPipeline):
 
     @property
     def scan_gap_ms(self) -> float:
-        """Milliseconds since last scan received."""
+        """Milliseconds since last scan received (or since start if none yet)."""
         if self._last_scan_ns == 0:
-            return 0.0
+            if self._started_at_ns == 0:
+                return 0.0
+            return ns_to_ms(now_ns() - self._started_at_ns)
         return ns_to_ms(now_ns() - self._last_scan_ns)
 
     # Background thread

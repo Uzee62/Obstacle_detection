@@ -104,9 +104,10 @@ def main() -> None:
 
     lidar_pipeline = LidarPerceptionPipeline(cfg)
     lidar_thread   = LidarSensorThread(
-        driver         = driver,
-        pipeline       = lidar_pipeline,
-        max_scan_gap_s = float(cfg.get("health", {}).get("max_scan_gap_s", 1.0)),
+        driver          = driver,
+        pipeline        = lidar_pipeline,
+        max_scan_gap_s  = float(cfg.get("health", {}).get("max_scan_gap_s", 1.0)),
+        startup_grace_s = float(cfg.get("health", {}).get("startup_grace_s", 20.0)),
     )
 
     tracker   = FusionTracker(cfg)

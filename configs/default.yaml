@@ -56,6 +56,7 @@ interfaces:
 
 health:
   max_scan_gap_s: 5.0          # trigger DEGRADED if no scan for this long (giving sensor time to recover)
+  startup_grace_s: 20.0        # publisher boot budget (motor warmup + reset + startScan retries)
   max_latency_ms: 80.0         # warn if pipeline takes longer than this
   stats_window_scans: 100      # rolling window for statistics
 
