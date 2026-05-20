@@ -55,7 +55,7 @@ interfaces:
   json_output_path: "~/tmp/world_model.json"
 
 health:
-  max_scan_gap_s: 1.0          # trigger DEGRADED if no scan for this long
+  max_scan_gap_s: 5.0          # trigger DEGRADED if no scan for this long (giving sensor time to recover)
   max_latency_ms: 80.0         # warn if pipeline takes longer than this
   stats_window_scans: 100      # rolling window for statistics
 

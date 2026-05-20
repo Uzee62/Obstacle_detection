@@ -119,6 +119,8 @@ int main(int argc, const char *argv[]) {
     // we don't tear the port down and force a cold motor restart, and
     // call stop() between attempts to clear any half-started state in
     // the device's firmware.
+    fprintf(stderr, "waiting for motor to reach speed...\n");  
+    usleep(3000 * 1000);   // 3 sec to give motor time warm up before first attempt, which is usually enough to avoid a retry at all
     const int    START_RETRIES_MAX = 6;
     const useconds_t START_RETRY_GAP_US = 500 * 1000;   // 0.5 s
     for (int attempt = 1; ; ++attempt) {
