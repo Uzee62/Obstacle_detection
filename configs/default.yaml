@@ -52,7 +52,7 @@ fusion:
   cycle_rate_hz: 10.0          # main fusion loop rate
 
 interfaces:
-  json_output_path: "~/tmp/world_model.json"
+  json_output_path: "/tmp/world_model.json"
 
 health:
   max_scan_gap_s: 5.0          # trigger DEGRADED if no scan for this long (giving sensor time to recover)

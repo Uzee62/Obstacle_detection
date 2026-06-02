@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 class JsonPublisher:
 
     def __init__(self, output_path: str) -> None:
-        self._path = Path(output_path)
+        self._path = Path(output_path).expanduser()
         self._path.parent.mkdir(parents=True, exist_ok=True)
         log.info("JsonPublisher: output → %s", self._path)
 
